@@ -7,7 +7,7 @@ import { useCoreVisualizer } from './hooks/useCoreVisualizer';
 
 const WAKE_PHRASES  = ['wake up', 'hey', 'activate', 'rise', 'jarvis'];
 const SLEEP_PHRASES = ['sleep', 'standby', 'goodbye', "that's all", 'stop listening'];
-const SLEEP_AFTER   = 30_000;
+const SLEEP_AFTER   = 60_000; // 60 seconds of silence before standby
 
 export default function App() {
   const [awakened,  setAwakened]  = useState(false);
@@ -15,17 +15,20 @@ export default function App() {
   const [messages,  setMessages]  = useState([]);
   const [logs,      setLogs]      = useState([{ t: 'System initialized.', type: 'system' }]);
 
-  const canvasRef     = useRef(null);
-  const srMainRef     = useRef(null);
-  const srWakeRef     = useRef(null);
-  const sleepTimer    = useRef(null);
-  const awakenedRef   = useRef(false);
-  const phaseRef      = useRef('idle');
-  const chatEndRef    = useRef(null);
-  const logEndRef     = useRef(null);
-  const isProcessing  = useRef(false);
-  const activateRef   = useRef(null);
-  const deactivateRef = useRef(null);
+  const canvasRef       = useRef(null);
+  const srMainRef       = useRef(null);
+  const srWakeRef       = useRef(null);
+  const sleepTimer      = useRef(null);
+  const awakenedRef     = useRef(false);
+  const phaseRef        = useRef('idle');
+  const chatEndRef      = useRef(null);
+  const logEndRef       = useRef(null);
+  const isProcessing    = useRef(false);
+  // All function refs — break circular deps and allow closures to always call latest version
+  const activateRef     = useRef(null);
+  const deactivateRef   = useRef(null);
+  const buildMainSRRef  = useRef(null);
+  const sendRef         = useRef(null);
 
   useEffect(() => { awakenedRef.current = awakened; }, [awakened]);
   useEffect(() => { phaseRef.current    = phase;    }, [phase]);
@@ -63,13 +66,14 @@ export default function App() {
     window.speechSynthesis.speak(u);
   }, []);
 
+  // ── send — calls buildMainSR via ref to avoid circular dep ──────
   const send = useCallback(async (text) => {
-    isProcessing.current = true;        // 🔒 Lock — mic will NOT restart
-    srMainRef.current?.abort();         // Kill mic immediately
+    isProcessing.current = true;
+    srMainRef.current?.abort();
     setPhase('think');
     setMessages(p => [...p, { r: 'user', t: text }]);
     addLog(`Processing: "${text}"`, 'system');
-    resetSleepTimer();
+
     try {
       const res  = await fetch('http://localhost:8000/chat', {
         method: 'POST',
@@ -80,13 +84,24 @@ export default function App() {
       const data = await res.json();
       setMessages(p => [...p, { r: 'jarvis', t: data.response }]);
       addLog('Response generated — speaking...', 'system');
+
       speak(data.response, () => {
         addLog('Jarvis finished speaking — resuming listener.', 'system');
-        isProcessing.current = false;  // 🔓 Unlock AFTER speaking done
-        setPhase('idle');              // triggers auto-restart below
+        isProcessing.current = false;
+        resetSleepTimer(); // Reset AFTER full task complete
+
+        // Fresh SR via ref — no circular dep, no stale aborted instance
+        if (awakenedRef.current) {
+          const freshSR = buildMainSRRef.current?.();
+          srMainRef.current = freshSR;
+          setTimeout(() => {
+            try { if (awakenedRef.current) freshSR?.start(); } catch (_) {}
+          }, 400);
+        }
       });
     } catch (e) {
       isProcessing.current = false;
+      resetSleepTimer();
       setPhase('error');
       addLog(`Error: ${e.message}`, 'error');
       speak("I encountered a system error, Sir.");
@@ -99,7 +114,7 @@ export default function App() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return null;
     const r = new SR();
-    r.continuous      = true;   // never times out
+    r.continuous      = true;
     r.interimResults  = true;
     r.lang            = 'en-US';
     r.maxAlternatives = 1;
@@ -128,8 +143,8 @@ export default function App() {
           deactivateRef.current?.();
           return;
         }
-        r.abort();    // stop listening before processing
-        send(text);
+        r.abort(); // stop mic before sending
+        sendRef.current?.(text); // call send via ref — no circular dep
       }, 600);
     };
 
@@ -140,7 +155,7 @@ export default function App() {
 
     r.onend = () => {
       clearTimeout(silenceTimer);
-      // Only restart when completely idle and not locked
+      // Only restart if idle and not locked
       if (awakenedRef.current && !isProcessing.current && phaseRef.current === 'idle') {
         setTimeout(() => {
           try {
@@ -153,18 +168,17 @@ export default function App() {
     };
 
     return r;
-  }, [send, speak, addLog]); // eslint-disable-line
+  }, [speak, addLog]); // no dep on `send` — uses sendRef
 
   // ── Wake SR — continuous, never has a gap ────────────────────────
   const buildWakeSR = useCallback(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return null;
     const r = new SR();
-    r.continuous     = true;   // never stops, never misses a phrase
-    r.interimResults = true;   // catch phrase mid-utterance
+    r.continuous     = true;
+    r.interimResults = true;
     r.lang           = 'en-US';
 
-    // Bias Chrome toward wake phrases
     if (window.SpeechGrammarList) {
       const gl = new window.SpeechGrammarList();
       gl.addFromString(
@@ -191,7 +205,6 @@ export default function App() {
     };
 
     r.onend = () => {
-      // Restart immediately with minimal gap (150ms) so nothing is missed
       if (!awakenedRef.current) {
         setTimeout(() => {
           try { if (!awakenedRef.current) r.start(); } catch (_) {}
@@ -200,22 +213,22 @@ export default function App() {
     };
 
     return r;
-  }, []); // eslint-disable-line
+  }, []);
 
   // ── Activate ─────────────────────────────────────────────────────
   const activate = useCallback(() => {
     setAwakened(true);
-    isProcessing.current = false;  // ensure unlocked on fresh activation
+    isProcessing.current = false;
     addLog('Security clearance granted. System Active.', 'system');
     srWakeRef.current?.abort();
     srMainRef.current?.abort();
-    const sr = buildMainSR();
+    const sr = buildMainSRRef.current?.();
     srMainRef.current = sr;
     speak('Jarvis is online and at your service, Sir.', () => {
       try { srMainRef.current?.start(); } catch (_) {}
     });
     resetSleepTimer();
-  }, [buildMainSR, resetSleepTimer, speak, addLog]);
+  }, [resetSleepTimer, speak, addLog]);
 
   // ── Deactivate ───────────────────────────────────────────────────
   const deactivate = useCallback(() => {
@@ -225,13 +238,16 @@ export default function App() {
     setPhase('idle');
     srMainRef.current?.abort();
     addLog('System entering standby.', 'system');
-    srWakeRef.current = buildWakeSR();
-    setTimeout(() => { try { srWakeRef.current?.start(); } catch (_) {} }, 400);
+    const wsr = buildWakeSR();
+    srWakeRef.current = wsr;
+    setTimeout(() => { try { wsr?.start(); } catch (_) {} }, 400);
   }, [buildWakeSR, addLog]);
 
-  // Keep refs in sync
-  useEffect(() => { activateRef.current   = activate;   }, [activate]);
-  useEffect(() => { deactivateRef.current = deactivate; }, [deactivate]);
+  // Keep all function refs in sync with latest versions
+  useEffect(() => { activateRef.current    = activate;    }, [activate]);
+  useEffect(() => { deactivateRef.current  = deactivate;  }, [deactivate]);
+  useEffect(() => { buildMainSRRef.current = buildMainSR; }, [buildMainSR]);
+  useEffect(() => { sendRef.current        = send;        }, [send]);
 
   // Auto-restart main SR when returning to idle and not locked
   useEffect(() => {
@@ -249,8 +265,9 @@ export default function App() {
 
   // Init wake SR on mount
   useEffect(() => {
-    srWakeRef.current = buildWakeSR();
-    setTimeout(() => { try { srWakeRef.current?.start(); } catch (_) {} }, 800);
+    const wsr = buildWakeSR();
+    srWakeRef.current = wsr;
+    setTimeout(() => { try { wsr?.start(); } catch (_) {} }, 800);
     return () => { srWakeRef.current?.abort(); srMainRef.current?.abort(); };
   }, []); // eslint-disable-line
 
