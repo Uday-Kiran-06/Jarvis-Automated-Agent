@@ -1,0 +1,14 @@
+groq
+google-generativeai
+openai
+anthropic
+python-dotenv
+pyaudio
+SpeechRecognition
+pydantic
+fastapi
+uvicorn
+duckduckgo-search
+tavily-python
+gTTS
+requests
