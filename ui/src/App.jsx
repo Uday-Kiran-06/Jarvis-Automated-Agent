@@ -14,6 +14,7 @@ export default function App() {
   const [phase,     setPhase]     = useState('idle');
   const [messages,  setMessages]  = useState([]);
   const [logs,      setLogs]      = useState([{ t: 'System initialized.', type: 'system' }]);
+  const [news,      setNews]      = useState(null); // State for structured news data
 
   const canvasRef       = useRef(null);
   const srMainRef       = useRef(null);
@@ -24,7 +25,6 @@ export default function App() {
   const chatEndRef      = useRef(null);
   const logEndRef       = useRef(null);
   const isProcessing    = useRef(false);
-  // All function refs — break circular deps and allow closures to always call latest version
   const activateRef     = useRef(null);
   const deactivateRef   = useRef(null);
   const buildMainSRRef  = useRef(null);
@@ -66,7 +66,6 @@ export default function App() {
     window.speechSynthesis.speak(u);
   }, []);
 
-  // ── send — calls buildMainSR via ref to avoid circular dep ──────
   const send = useCallback(async (text) => {
     isProcessing.current = true;
     srMainRef.current?.abort();
@@ -85,12 +84,22 @@ export default function App() {
       setMessages(p => [...p, { r: 'jarvis', t: data.response }]);
       addLog('Response generated — speaking...', 'system');
 
+      // Check if this was a news tool call
+      if (data.tool === 'search_news' && data.tool_result) {
+        try {
+          const newsItems = JSON.parse(data.tool_result);
+          if (Array.isArray(newsItems)) {
+            setNews(newsItems);
+          }
+        } catch (e) {
+          console.error("Failed to parse news result:", e);
+        }
+      }
+
       speak(data.response, () => {
         addLog('Jarvis finished speaking — resuming listener.', 'system');
         isProcessing.current = false;
-        resetSleepTimer(); // Reset AFTER full task complete
-
-        // Fresh SR via ref — no circular dep, no stale aborted instance
+        resetSleepTimer();
         if (awakenedRef.current) {
           const freshSR = buildMainSRRef.current?.();
           srMainRef.current = freshSR;
@@ -109,7 +118,6 @@ export default function App() {
     }
   }, [resetSleepTimer, speak, addLog]);
 
-  // ── Main SR — continuous, stays open indefinitely ────────────────
   const buildMainSR = useCallback(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return null;
@@ -143,8 +151,8 @@ export default function App() {
           deactivateRef.current?.();
           return;
         }
-        r.abort(); // stop mic before sending
-        sendRef.current?.(text); // call send via ref — no circular dep
+        r.abort();
+        sendRef.current?.(text);
       }, 600);
     };
 
@@ -155,7 +163,6 @@ export default function App() {
 
     r.onend = () => {
       clearTimeout(silenceTimer);
-      // Only restart if idle and not locked
       if (awakenedRef.current && !isProcessing.current && phaseRef.current === 'idle') {
         setTimeout(() => {
           try {
@@ -168,9 +175,8 @@ export default function App() {
     };
 
     return r;
-  }, [speak, addLog]); // no dep on `send` — uses sendRef
+  }, [speak, addLog]);
 
-  // ── Wake SR — continuous, never has a gap ────────────────────────
   const buildWakeSR = useCallback(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return null;
@@ -215,7 +221,6 @@ export default function App() {
     return r;
   }, []);
 
-  // ── Activate ─────────────────────────────────────────────────────
   const activate = useCallback(() => {
     setAwakened(true);
     isProcessing.current = false;
@@ -230,12 +235,12 @@ export default function App() {
     resetSleepTimer();
   }, [resetSleepTimer, speak, addLog]);
 
-  // ── Deactivate ───────────────────────────────────────────────────
   const deactivate = useCallback(() => {
     clearTimeout(sleepTimer.current);
     isProcessing.current = false;
     setAwakened(false);
     setPhase('idle');
+    setNews(null); // Clear news on standby
     srMainRef.current?.abort();
     addLog('System entering standby.', 'system');
     const wsr = buildWakeSR();
@@ -243,13 +248,11 @@ export default function App() {
     setTimeout(() => { try { wsr?.start(); } catch (_) {} }, 400);
   }, [buildWakeSR, addLog]);
 
-  // Keep all function refs in sync with latest versions
   useEffect(() => { activateRef.current    = activate;    }, [activate]);
   useEffect(() => { deactivateRef.current  = deactivate;  }, [deactivate]);
   useEffect(() => { buildMainSRRef.current = buildMainSR; }, [buildMainSR]);
   useEffect(() => { sendRef.current        = send;        }, [send]);
 
-  // Auto-restart main SR when returning to idle and not locked
   useEffect(() => {
     if (awakened && phase === 'idle' && !isProcessing.current) {
       const t = setTimeout(() => {
@@ -263,7 +266,6 @@ export default function App() {
     }
   }, [awakened, phase]);
 
-  // Init wake SR on mount
   useEffect(() => {
     const wsr = buildWakeSR();
     srWakeRef.current = wsr;
@@ -291,6 +293,30 @@ export default function App() {
           {awakened ? phase.toUpperCase() : 'STANDBY'}
         </div>
         <div className="status-pill">ENC: AES-256</div>
+      </div>
+
+      {/* News Widget Overlay */}
+      <div className={`news-widget ${news ? 'active' : ''}`}>
+        <div className="news-header">
+          <h2>Neural News Feed</h2>
+          <button className="close-news" onClick={() => setNews(null)}>Close Terminal</button>
+        </div>
+        <div className="news-grid">
+          {news && news.map((item, idx) => (
+            <div key={idx} className="news-card">
+              {item.image && <img src={item.image} alt="" className="news-img" />}
+              <div className="news-content">
+                <div className="news-meta">
+                  <span>{item.source}</span>
+                  <span>{item.date}</span>
+                </div>
+                <h3>{item.title}</h3>
+                <p className="news-desc">{item.description}</p>
+                <a href={item.url} target="_blank" rel="noreferrer" className="read-more">Open Full Briefing</a>
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
 
       <div className="side-panel left-panel">

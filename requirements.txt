@@ -12,3 +12,5 @@ duckduckgo-search
 tavily-python
 gTTS
 requests
+playwright
+beautifulsoup4

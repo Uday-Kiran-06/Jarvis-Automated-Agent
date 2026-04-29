@@ -7,6 +7,8 @@ import re
 import datetime
 from typing import Dict, Any
 from duckduckgo_search import DDGS
+import asyncio
+from automation import run_web_task, organize_directory, search_files, get_directory_summary
 
 # ─── App name map (Windows) ──────────────────────────────────────
 APP_MAP = {
@@ -140,23 +142,7 @@ def set_volume(level: int) -> str:
     """Sets the system volume (0-100) on Windows."""
     try:
         level = max(0, min(100, int(level)))
-        # Use PowerShell to set volume
-        script = (
-            f"$wshShell = New-Object -ComObject WScript.Shell;"
-            f"$currentVol = [Math]::Round((Get-WmiObject Win32_SoundDevice).Name);"
-            f"[audio]::Volume = {level / 100};"
-        )
-        # Simpler alternative using nircmd if available, else PowerShell
-        cmd = f'powershell -c "(New-Object -ComObject WScript.Shell).SendKeys([char]173)" '
-        # Use PowerShell Audio API
-        ps = f"""
-        Add-Type -TypeDefinition @'
-        using System.Runtime.InteropServices;
-        [Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        interface IAudioEndpointVolume {{ int _0(); int _1(); int _2(); int _3(); int SetMasterVolumeLevelScalar(float fLevel, System.Guid pguidEventContext); }}
-        '@
-        """
-        # Simplest reliable way on Windows:
+        # Simplified reliable way on Windows:
         subprocess.run(
             f'powershell -Command "[System.Media.SystemSounds]::Beep.Play()"',
             shell=True, capture_output=True
@@ -206,10 +192,19 @@ def search_news(query: str = "latest news", max_results: int = 5) -> str:
             results = list(ddgs.news(query, max_results=max_results))
         if not results:
             return "No news found."
-        return "\n\n".join(
-            f"[{i+1}] {r.get('title','')}\n    Source: {r.get('source','?')} — {r.get('date','')}\n    {r.get('body','')[:200]}"
-            for i, r in enumerate(results)
-        )
+        
+        # Return structured data as JSON so the frontend can render rich cards
+        formatted = []
+        for r in results:
+            formatted.append({
+                "title": r.get("title", ""),
+                "url": r.get("url", r.get("href", "")),
+                "source": r.get("source", ""),
+                "date": r.get("date", ""),
+                "description": r.get("body", ""),
+                "image": r.get("image", "")
+            })
+        return json.dumps(formatted)
     except Exception as e:
         return f"News error: {e}"
 
@@ -233,6 +228,11 @@ TOOLS = {
     "write_file":         write_file,
     "list_directory":     list_directory,
     "execute_command":    execute_command,
+    # Automation
+    "automate_browser":   run_web_task,
+    "organize_files":     organize_directory,
+    "search_files":       search_files,
+    "get_dir_summary":    get_directory_summary,
 }
 
 TOOL_DESCRIPTIONS = """
@@ -240,12 +240,12 @@ AVAILABLE TOOLS — respond ONLY with JSON to use one:
 {"tool": "name", "args": {"key": "value"}}
 
 SEARCH:
-  search_web(query, max_results=5)         — DuckDuckGo web search
-  search_news(query, max_results=5)        — DuckDuckGo news headlines
+  search_news(query, max_results=5)        — latest news headlines with images
+  search_web(query, max_results=5)         — general web search
 
-APPS & BROWSER:
-  open_application(name)                   — open Chrome, Spotify, Notepad, VS Code, etc.
-  search_and_open(query)                   — open Google search in browser
+APPLICATIONS:
+  open_application(name)                   — Chrome, Spotify, Notepad, Calculator, Discord...
+  search_and_open(query)                   — search and open in browser
   open_url(url)                            — open a specific URL
 
 SYSTEM:
@@ -254,14 +254,24 @@ SYSTEM:
   set_volume(level)                        — 0–100
   take_screenshot()                        — save screenshot to Desktop
 
-FILE:
+FILE SYSTEM:
   read_file(file_path)
   write_file(file_path, content)
   list_directory(directory)
-  execute_command(command)                 — run any terminal command
+  execute_command(command)                 — run terminal commands
+
+AUTOMATION:
+  automate_browser(url, task_type='content', **kwargs) — 'content', 'screenshot', 'search'
+  organize_files(folder_path)              — sort files by extension into subfolders
+  search_files(directory, pattern)         — recursive glob search
+  get_dir_summary(directory)               — file count and total size
 """
 
-def call_tool(name: str, args: Dict[str, Any]) -> str:
+async def call_tool(name: str, args: Dict[str, Any]) -> str:
     if name in TOOLS:
-        return TOOLS[name](**args)
+        func = TOOLS[name]
+        if asyncio.iscoroutinefunction(func):
+            return await func(**args)
+        else:
+            return func(**args)
     return f"Tool '{name}' not found. Available: {list(TOOLS.keys())}"

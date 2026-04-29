@@ -41,6 +41,9 @@ Available tools:
 - get_system_info() → time, date, CPU, RAM, battery
 - set_volume(level) → set volume 0-100
 - take_screenshot() → save a screenshot
+- automate_browser(url, task_type='content') → extract web content or take screenshots
+- organize_files(folder_path) → sort files into subfolders by extension
+- search_files(directory, pattern) → find files recursively
 
 For normal conversation (greetings, math, opinions, general chat) — respond naturally in 1-3 sentences. Do NOT use JSON for normal chat.
 """
@@ -53,29 +56,34 @@ class CommandRequest(BaseModel):
 
 def extract_tool_call(text: str) -> dict | None:
     """
-    Strictly extracts a tool call JSON ONLY if the response is PURELY a JSON block.
-    Prevents false positives from conversational responses that happen to contain braces.
+    Finds and extracts a tool call JSON from the text.
+    Prioritizes pure JSON, then code blocks, then raw braces.
     """
     stripped = text.strip()
-    # Must start with { and end with } to be a tool call
-    if not (stripped.startswith('{') and stripped.endswith('}')):
-        return None
-    try:
-        data = json.loads(stripped)
-        if "tool" in data:
-            return data
-    except Exception:
-        pass
+    
+    # 1. Try pure JSON (most common/intended)
+    if stripped.startswith('{') and stripped.endswith('}'):
+        try:
+            data = json.loads(stripped)
+            if "tool" in data: return data
+        except Exception: pass
 
-    # Fallback: try to find ```json ... ``` code blocks
+    # 2. Try Markdown code blocks
     match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
     if match:
         try:
             data = json.loads(match.group(1))
-            if "tool" in data:
-                return data
-        except Exception:
-            pass
+            if "tool" in data: return data
+        except Exception: pass
+
+    # 3. Aggressive: find the FIRST occurrence of something that looks like {"tool": ...}
+    # This catches cases where the LLM talks before the JSON.
+    match = re.search(r'(\{[\s\S]*?"tool"[\s\S]*?\})', text)
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            if "tool" in data: return data
+        except Exception: pass
 
     return None
 
@@ -102,7 +110,7 @@ async def chat(request: CommandRequest):
         )
         print(f"[LLM RAW] {llm_response[:300]}")
 
-        # Step 2 — check if it's a strict tool call (response must BE json, not contain json)
+        # Step 2 — check if it's a strict tool call
         tool_data = extract_tool_call(llm_response)
 
         if tool_data:
@@ -110,26 +118,28 @@ async def chat(request: CommandRequest):
             tool_args = tool_data.get("args", {})
             print(f"[TOOL] Calling {tool_name} with {tool_args}")
 
-            raw_result = call_tool(tool_name, tool_args)
+            raw_result = await call_tool(tool_name, tool_args)
             print(f"[TOOL RESULT] {str(raw_result)[:300]}")
 
             # Step 3 — LLM summarizes the result naturally
             summary_prompt = (
                 f'The user asked: "{request.command}"\n\n'
-                f"Tool '{tool_name}' returned:\n{raw_result}\n\n"
-                f"Summarize this result for the user in 1-3 natural sentences as Jarvis. "
-                f"Be conversational, no JSON, no bullet points."
+                f"Tool '{tool_name}' returned raw data: {raw_result}\n\n"
+                f"As Jarvis, provide a very brief (1-2 sentences) natural confirmation of what you found. "
+                f"Do not repeat details like URLs or long summaries, as the user can see them in their dashboard. "
+                f"Example: 'I have found the latest news for you, Sir. The headlines are now visible on your display.'"
             )
             final_reply = chat_completion(
                 summary_prompt,
                 provider=request.provider,
-                system_prompt="You are Jarvis. Summarize tool results clearly and naturally. Never output JSON.",
+                system_prompt="You are Jarvis. Provide a brief, natural confirmation of tool results. Keep it to one or two sentences. Never output JSON.",
             )
             print(f"[JARVIS] {final_reply[:200]}")
 
             return {
                 "response": final_reply,
                 "tool": tool_name,
+                "tool_result": raw_result,
                 "type": "tool_execution",
             }
 
